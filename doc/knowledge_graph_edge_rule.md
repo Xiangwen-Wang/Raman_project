@@ -1,12 +1,19 @@
 # Knowledge Graph Schema — Raman-informed 2D Material Exploration Agent
 
-This document defines the knowledge graph (KG) that the exploration agent navigates. The agent is **read-only over structures**: it does not generate or modify materials. It only retrieves, ranks, and explains.
+This document defines the knowledge graph (KG) that the exploration agent navigates.
+
+The agent is **read-only over structures**: it does not generate or modify materials. It only retrieves, expands, ranks, queries, updates, and explains candidate materials.
 
 The KG is a **typed multigraph**:
 
-- **Nodes** = materials (one node per entry in the DB).
-- **Edges** = typed relations between two materials, each carrying a `relation_type` and a scalar `weight` in `[0, 1]`.
-- Multiple edges of different types between the same pair are allowed and **must** be preserved — they are the provenance the agent uses to explain "why these two materials are related".
+* **Nodes** = materials, one node per database entry.
+* **Edges** = typed relations between two materials.
+* Each edge carries a `relation_type` and optional evidence attributes.
+* Edges are **binary**: the graph only defines whether a relation exists.
+* The KG does **not** assign hand-designed edge weights.
+* Multiple edges of different types between the same pair are allowed and must be preserved.
+
+The reason is that the relative importance of different relations is uncertain. Instead of manually deciding that one relation is stronger than another, the agent should learn which relation type is useful through its exploration policy and reward.
 
 ---
 
@@ -14,200 +21,611 @@ The KG is a **typed multigraph**:
 
 Every node stores at minimum:
 
-| field                 | type              | notes                                                     |
-|-----------------------|-------------------|-----------------------------------------------------------|
-| `material_id`         | str               | unique key                                                |
-| `formula`             | str               | e.g. `MoSSe`                                              |
-| `prototype`           | str               | structural prototype label (e.g. `2H`, `1T`, `1T'`, ...)  |
-| `family`              | str               | coarse chemical family (e.g. `TMDC`, `MXene`, ...)        |
-| `metal`               | str               | metal element symbol                                      |
-| `chalcogen_top`       | str               | top-layer chalcogen                                       |
-| `chalcogen_bottom`    | str               | bottom-layer chalcogen                                    |
-| `is_janus`            | bool              | `chalcogen_top != chalcogen_bottom`                       |
-| `raman_spectrum`      | np.ndarray[4000]  | raw / preprocessed Raman intensities                      |
-| `structure_embedding` | np.ndarray[d_s]   | pretrained structure graph embedding (given)              |
-| `raman_embedding`     | np.ndarray[d_r]   | pretrained Raman embedding (given)                        |
+| field                          | type             | notes                                                         |
+| ------------------------------ | ---------------- | ------------------------------------------------------------- |
+| `material_id`                  | str              | unique key                                                    |
+| `formula`                      | str              | e.g. `MoSSe`                                                  |
+| `prototype`                    | str              | structural prototype label, e.g. `2H`, `1T`, `1T'`            |
+| `prototype_base`               | str              | normalized prototype label, e.g. stripping `-Janus` if needed |
+| `family`                       | str              | coarse chemical family, e.g. `TMDC`, `MXene`                  |
+| `metal`                        | str              | metal element symbol                                          |
+| `chalcogen_top`                | str              | top-layer chalcogen                                           |
+| `chalcogen_bottom`             | str              | bottom-layer chalcogen                                        |
+| `is_janus`                     | bool             | `chalcogen_top != chalcogen_bottom`                           |
+| `metal_atomic_mass`            | float            | atomic mass of metal element                                  |
+| `chalcogen_top_atomic_mass`    | float            | atomic mass of top chalcogen                                  |
+| `chalcogen_bottom_atomic_mass` | float            | atomic mass of bottom chalcogen                               |
+| `mean_chalcogen_mass`          | float            | average mass of top and bottom chalcogens                     |
+| `chalcogen_mass_asymmetry`     | float            | `abs(m_top - m_bottom)`                                       |
+| `mass_vector`                  | np.ndarray[3]    | `[metal_mass, top_chalcogen_mass, bottom_chalcogen_mass]`     |
+| `raman_spectrum`               | np.ndarray[4000] | raw / preprocessed Raman intensities                          |
+| `raman_peaks`                  | list             | optional peak list for downstream explanation                 |
+| `structure_embedding`          | np.ndarray[d_s]  | pretrained structure graph embedding                          |
+| `raman_embedding`              | np.ndarray[d_r]  | pretrained Raman embedding                                    |
 
-> Derived fields like `is_janus` must be computed once at ingest time so
-> rules below can assume they exist.
+Derived fields such as `is_janus`, `prototype_base`, and atomic-mass features should be computed once at ingest time so the rules below can assume they exist.
+
+Atomic mass is included because Raman peak shifts are often related to atomic mass changes, especially for chemically similar structures where heavier atoms tend to lower vibrational frequencies.
 
 ---
 
 ## 2. Design principles
 
-Before listing the rules, the conventions they all follow:
+Before listing the rules, the KG follows these conventions:
 
-1. **No self-loops.** Never add an edge from a node to itself.
-2. **Undirected.** Every rule below is symmetric. Store each pair once.
-3. **Specificity beats breadth.** If a more specific rule already connects two nodes with a higher weight, the less specific rule's edge is still stored (for explanation), but aggregation uses `max` per pair, not `sum`.
-4. **Embeddings are the single source of truth for "similarity".** Raw 4000-dim Raman cosine is **not** used as a separate edge — the Raman embedding already encodes it and using both double-counts the same signal. Raw spectra are kept on the node for visualization and for the agent's downstream reasoning, not as edges.
-5. **Similarity edges are sparsified by percentile, not by absolute threshold.** Absolute cosine thresholds don't transfer across datasets or embedding versions. We keep the top-`p%` of pairs per rule.
-6. **Typed edges are preserved** even when redundant. The agent uses the *set* of edge types between a pair as the explanation.
+1. **No self-loops.**
+   Never add an edge from a node to itself.
+
+2. **Undirected edges.**
+   Every rule below is symmetric. Store each pair once.
+
+3. **Edges are unweighted.**
+   A rule only decides whether a typed edge exists. It does not assign a scalar weight.
+
+4. **Typed edges are preserved.**
+   If two materials are related by multiple rules, keep all relation types. The set of relation types is part of the explanation.
+
+5. **Edge attributes are evidence, not weights.**
+   Values such as `composition_distance`, `shared_chalcogen_count`, `cosine_similarity`, or `atomic_mass_delta` can be stored as edge metadata, but they should not be treated as manually designed edge weights.
+
+6. **The agent learns which edge type to follow.**
+   The KG provides possible exploration routes. The exploration policy / action ranker learns whether to follow `same_prototype`, `atomic_mass_neighbor`, `raman_embedding_neighbor`, etc.
+
+7. **Raw Raman spectra are kept on nodes, not used as raw cosine edges.**
+   Raw Raman spectra and peak lists are used for visualization, Raman matching, and explanation. Graph-level Raman similarity is represented by `raman_embedding_neighbor`.
+
+8. **Embedding-based edges are sparsified by percentile.**
+   Absolute cosine thresholds may not transfer across datasets or embedding versions. For embedding relations, keep only the top `p%` most similar pairs.
 
 ---
 
 ## 3. Edge rules
 
-There are **two groups**: categorical (rules R1–R4) and embedding-based (rules R5–R6). Janus relationships are encoded as an **edge attribute**,not a separate edge type, to avoid overlap with R2.
+The KG contains three groups of edge rules:
 
-### Group A — Categorical / compositional edges
+* **Group A:** symbolic / compositional relations
+* **Group B:** atomic-mass relations
+* **Group C:** embedding-based relations
 
-These come from discrete node attributes. They are cheap, exact, and highly interpretable.
+All rules create edges without manual weights.
 
-#### R1. `structure_neighbor` — weight `0.90`
+---
 
-The strongest categorical edge: same prototype, one atomic substitution away.
+# Group A — Symbolic / compositional edges
 
-**Conditions (all must hold):**
-- `prototype[a] == prototype[b]`
-- `composition_distance(a, b) == 1`
+These edges come from discrete material attributes. They are cheap, exact, and interpretable.
 
-where
+---
+
+## R1. `structure_neighbor`
+
+Same prototype and one atomic site away.
+
+### Conditions
+
+All must hold:
+
+```python
+prototype_base[a] == prototype_base[b]
+composition_distance(a, b) == 1
 ```
+
+where:
+
+```python
 composition_distance(a, b) =
     int(metal[a]            != metal[b])
   + int(chalcogen_top[a]    != chalcogen_top[b])
   + int(chalcogen_bottom[a] != chalcogen_bottom[b])
 ```
 
-**Edge attributes:**
-- `relation_type = "structure_neighbor"`
-- `weight = 0.90`
-- `is_janus_pair = (is_janus[a] != is_janus[b])`  *(replaces old R6)*
+### Edge attributes
 
-Rationale: R6 "janus_analog" in the original list was a strict subset of this rule (same prototype, shared chalcogen, different `is_janus` → composition_distance is 1 or 2). We fold it in as an attribute so the agent can still filter by "Janus ↔ non-Janus analog" without creating a second edge that the aggregator would have to dedupe.
-
-> **Check before implementing:** verify whether your DB assigns the *same*
-> prototype label to a Janus material and its non-Janus parent (e.g.
-> MoS2 `2H` vs MoSSe `2H-Janus`). If they get different prototype strings,
-> this rule will miss Janus analogs — in that case either normalize the
-> prototype field or add a separate rule `R1b` that relaxes `prototype`
-> equality to "prototype base equality" (stripping the `-Janus` suffix).
-
-#### R2. `same_prototype` — weight `0.80`
-
-**Conditions:**
-- `prototype[a] == prototype[b]`
-- R1 does **not** already fire for `(a, b)` *(i.e. composition_distance >= 2)*
-
-**Weight:** `0.80`.
-
-Keeping R1's pairs out of R2 prevents two edges with the same categorical information from coexisting on the same pair.
-
-#### R3. `shared_chalcogen` — weight `0.60` or `0.70`
-
-Chalcogen composition overlap, independent of prototype.
-
-```
-left  = {chalcogen_top[a], chalcogen_bottom[a]}
-right = {chalcogen_top[b], chalcogen_bottom[b]}
-k = len(left & right)
+```python
+relation_type = "structure_neighbor"
+composition_distance = 1
+changed_site = one of ["metal", "chalcogen_top", "chalcogen_bottom"]
+is_janus_pair = (is_janus[a] != is_janus[b])
 ```
 
-- If `k == 0`: no edge.
-- If `k >= 1`: `weight = 0.50 + 0.10 * k`, so `k=1 -> 0.60`, `k=2 -> 0.70`.
+### Rationale
 
-> Note: `k == 2` is only reachable when **both** materials are Janus with
-> the *same* unordered pair of chalcogens. Non-Janus materials have set
-> size 1, so intersecting two non-Janus materials gives at most `k == 1`.
-> This is the intended semantics — no change needed, but document it.
+This edge captures materials that are structurally close and differ by one atomic substitution.
 
-#### R4. `same_family` — weight `0.50` *(downgraded)*
-
-**Conditions:**
-- `family[a] == family[b]`
-- R1, R2 do not fire for `(a, b)`
-
-Because `same_prototype` usually implies `same_family`, we only emit R4 when nothing stronger already connects the pair. Weight reduced from the originally proposed `0.65` to `0.50` to reflect that `family` is the *coarsest* categorical signal.
-
+It does not mean the agent modifies one material into another. It only means these two materials are close neighbors in the existing structure space.
 
 ---
 
-### Group B — Embedding-based similarity edges
+## R2. `same_prototype`
 
-These use the two pretrained embeddings you already have. They capture **continuous** similarity that the categorical rules can't express.
+Same structural prototype.
 
-#### General recipe (applies to R5 and R6)
+### Conditions
 
-For embedding vectors `e_a`, `e_b`:
+```python
+prototype_base[a] == prototype_base[b]
+```
 
-1. L2-normalize once at ingest: `e_hat = e / ||e||_2`.
-2. Compute cosine: `sim = e_hat_a . e_hat_b` (range `[-1, 1]`; in practice `[0, 1]` for these embeddings).
-3. **Sparsify by percentile, not by absolute threshold.** For each rule, keep only the **top `p` percent** of all unordered pairs, globally.
-   Recommended defaults:
-   - `p_structure_embedding = 1.0` (top 1% of pairs)
-   - `p_raman_embedding     = 1.0` (top 1% of pairs)
-4. The **edge weight is the cosine similarity itself**, clipped to `[0, 1]`. No rescaling — the agent can compare weights across R5/R6 directly because both are cosine in `[0, 1]`.
+### Edge attributes
 
-Expose the percentiles in `cfg` so they are tunable:
+```python
+relation_type = "same_prototype"
+prototype_base = prototype_base[a]
+```
+
+### Rationale
+
+This gives the agent a broad structure-based exploration route.
+
+Unlike the previous weighted version, this edge is not suppressed when `structure_neighbor` also exists. If two materials are both `structure_neighbor` and `same_prototype`, both edges are preserved.
+
+---
+
+## R3. `shared_chalcogen`
+
+The two materials share at least one chalcogen element.
+
+### Conditions
+
+```python
+left  = {chalcogen_top[a], chalcogen_bottom[a]}
+right = {chalcogen_top[b], chalcogen_bottom[b]}
+
+shared = left & right
+k = len(shared)
+
+k >= 1
+```
+
+### Edge attributes
+
+```python
+relation_type = "shared_chalcogen"
+shared_chalcogens = list(shared)
+shared_chalcogen_count = k
+```
+
+### Rationale
+
+This edge provides a chemically interpretable exploration route.
+
+For non-Janus materials, the chalcogen set usually has size `1`.
+For Janus materials, the set can have size `2`.
+
+This edge is only a symbolic route. It does not imply that sharing a chalcogen is always more important than other relations.
+
+---
+
+## R4. `same_family`
+
+The two materials belong to the same coarse chemical family.
+
+### Conditions
+
+```python
+family[a] == family[b]
+```
+
+### Edge attributes
+
+```python
+relation_type = "same_family"
+family = family[a]
+```
+
+### Rationale
+
+This is a coarse exploration route. It is useful for broad search or cold-start graph construction, but the agent should learn whether this relation is useful in a given Raman-guided task.
+
+---
+
+## R5. `janus_analog`
+
+Janus and non-Janus analogs with related composition.
+
+### Conditions
+
+All must hold:
+
+```python
+prototype_base[a] == prototype_base[b]
+metal[a] == metal[b]
+is_janus[a] != is_janus[b]
+shared_chalcogen_count(a, b) >= 1
+```
+
+where:
+
+```python
+shared_chalcogen_count(a, b) =
+    len(
+        {chalcogen_top[a], chalcogen_bottom[a]}
+      & {chalcogen_top[b], chalcogen_bottom[b]}
+    )
+```
+
+### Edge attributes
+
+```python
+relation_type = "janus_analog"
+is_janus_pair = True
+shared_chalcogens = list(shared)
+```
+
+### Rationale
+
+This edge is kept as an explicit relation type because Janus materials may introduce symmetry breaking and additional Raman-active modes.
+
+Even if this relation overlaps with `structure_neighbor` or `same_prototype`, it should be preserved because it gives the agent an interpretable Janus-specific exploration route.
+
+---
+
+# Group B — Atomic-mass edges
+
+Atomic mass is added as a separate exploration route because Raman frequencies are strongly related to vibrational masses and force constants. For structurally similar materials, replacing lighter atoms with heavier atoms often shifts Raman modes toward lower frequencies.
+
+These edges do not claim that atomic mass alone determines Raman spectra. They only provide a physically meaningful route for exploration.
+
+---
+
+## R6. `atomic_mass_neighbor`
+
+The two materials have similar atomic-mass patterns.
+
+### Conditions
+
+Compute the mass vector:
+
+```python
+mass_vector[i] = [
+    metal_atomic_mass[i],
+    chalcogen_top_atomic_mass[i],
+    chalcogen_bottom_atomic_mass[i]
+]
+```
+
+Compute normalized distance:
+
+```python
+mass_distance(a, b) =
+    ||mass_vector[a] - mass_vector[b]||_2
+    / mean(||mass_vector[a]||_2, ||mass_vector[b]||_2)
+```
+
+Create an edge if the pair is among the top `p_mass%` closest pairs by `mass_distance`, or if:
+
+```python
+mass_distance(a, b) <= cfg.atomic_mass_max_distance
+```
+
+Recommended defaults:
+
+```yaml
+kg:
+  atomic_mass_top_percent: 2.0
+  atomic_mass_max_distance: 0.15
+```
+
+### Edge attributes
+
+```python
+relation_type = "atomic_mass_neighbor"
+mass_distance = mass_distance(a, b)
+metal_mass_delta = abs(metal_atomic_mass[a] - metal_atomic_mass[b])
+top_chalcogen_mass_delta = abs(chalcogen_top_atomic_mass[a] - chalcogen_top_atomic_mass[b])
+bottom_chalcogen_mass_delta = abs(chalcogen_bottom_atomic_mass[a] - chalcogen_bottom_atomic_mass[b])
+```
+
+### Rationale
+
+This edge lets the agent explore materials that are close in atomic-mass space, even if their symbolic labels are not identical.
+
+It is useful for Raman-guided search because similar atomic masses may lead to similar vibrational frequency ranges.
+
+---
+
+## R7. `chalcogen_mass_trend`
+
+The two materials differ mainly by chalcogen mass under a comparable structural setting.
+
+### Conditions
+
+All must hold:
+
+```python
+prototype_base[a] == prototype_base[b]
+metal[a] == metal[b]
+mean_chalcogen_mass[a] != mean_chalcogen_mass[b]
+```
+
+Optionally require:
+
+```python
+abs(mean_chalcogen_mass[a] - mean_chalcogen_mass[b])
+    >= cfg.min_chalcogen_mass_delta
+```
+
+Recommended default:
+
+```yaml
+kg:
+  min_chalcogen_mass_delta: 5.0
+```
+
+### Edge attributes
+
+```python
+relation_type = "chalcogen_mass_trend"
+mean_chalcogen_mass_delta =
+    mean_chalcogen_mass[b] - mean_chalcogen_mass[a]
+
+lighter_material =
+    material with smaller mean_chalcogen_mass
+
+heavier_material =
+    material with larger mean_chalcogen_mass
+
+expected_raman_shift_direction =
+    "heavier_chalcogen_likely_lower_frequency"
+```
+
+### Rationale
+
+This edge captures a physically interpretable Raman trend:
+
+```text
+S → Se → Te
+```
+
+usually increases chalcogen mass and may shift related vibrational modes toward lower Raman frequencies, assuming comparable bonding and structure.
+
+This relation is especially useful for TMD-like and Janus-TMD-like materials.
+
+The edge is still undirected in storage, but the edge attributes record the lighter-to-heavier direction for explanation.
+
+---
+
+## R8. `janus_mass_asymmetry`
+
+The two materials have related Janus mass-asymmetry patterns.
+
+### Conditions
+
+Both materials are Janus:
+
+```python
+is_janus[a] == True
+is_janus[b] == True
+```
+
+and their chalcogen mass asymmetry is similar:
+
+```python
+abs(
+    chalcogen_mass_asymmetry[a]
+  - chalcogen_mass_asymmetry[b]
+) <= cfg.janus_mass_asymmetry_tolerance
+```
+
+Recommended default:
+
+```yaml
+kg:
+  janus_mass_asymmetry_tolerance: 5.0
+```
+
+### Edge attributes
+
+```python
+relation_type = "janus_mass_asymmetry"
+mass_asymmetry_a = chalcogen_mass_asymmetry[a]
+mass_asymmetry_b = chalcogen_mass_asymmetry[b]
+mass_asymmetry_delta =
+    abs(chalcogen_mass_asymmetry[a] - chalcogen_mass_asymmetry[b])
+```
+
+### Rationale
+
+Janus materials break top-bottom symmetry. The mass difference between top and bottom chalcogen layers may be relevant to Raman-active modes and mode splitting.
+
+This edge gives the agent a Janus-specific mass-based exploration route.
+
+---
+
+# Group C — Embedding-based edges
+
+Embedding-based edges capture continuous similarities that categorical and mass rules cannot fully express.
+
+They are still unweighted KG edges. Similarity values can be stored as metadata, but the agent should learn how much to rely on them.
+
+---
+
+## General recipe for embedding edges
+
+For embedding vectors `e_a` and `e_b`:
+
+1. L2-normalize once at ingest:
+
+```python
+e_hat = e / ||e||_2
+```
+
+2. Compute cosine similarity:
+
+```python
+sim = dot(e_hat_a, e_hat_b)
+```
+
+3. Sparsify by percentile:
+
+```python
+keep only top p% of unordered pairs
+```
+
+4. Create an edge if the pair is retained.
+
+The cosine similarity is stored only as metadata:
+
+```python
+cosine_similarity = sim
+```
+
+It is not treated as a hand-designed edge weight.
+
+---
+
+## R9. `structure_embedding_neighbor`
+
+### Conditions
+
+The pair is among the top `p_structure_embedding%` most similar pairs by structure embedding cosine similarity.
+
+Recommended default:
+
 ```yaml
 kg:
   structure_embedding_top_percent: 1.0
-  raman_embedding_top_percent: 1.0
+  structure_embedding_min_sim: 0.5
 ```
 
-Optionally also support absolute floors as a safety net (e.g. never keep an edge with `sim < 0.5` even if it falls in the top percentile on a small dataset):
+### Edge attributes
+
+```python
+relation_type = "structure_embedding_neighbor"
+structure_embedding_cosine = sim_structure
+```
+
+### Rationale
+
+This edge captures structural similarity that symbolic rules may miss, such as geometrically or topologically similar structures with different prototype labels.
+
+---
+
+## R10. `raman_embedding_neighbor`
+
+### Conditions
+
+The pair is among the top `p_raman_embedding%` most similar pairs by Raman embedding cosine similarity.
+
+Recommended default:
+
 ```yaml
 kg:
-  structure_embedding_min_sim: 0.5
+  raman_embedding_top_percent: 1.0
   raman_embedding_min_sim: 0.5
 ```
 
-#### R5. `structure_embedding_neighbor`
+### Edge attributes
 
-- **Embedding:** `structure_embedding` (pretrained structure graph embedding, already available per node).
-- **Score:** cosine similarity on L2-normalized vectors.
-- **Sparsification:** keep top `p_structure_embedding` percent of all pairs, subject to optional absolute floor.
-- **Edge:**
-  - `relation_type = "structure_embedding_neighbor"`
-  - `weight       = sim_structure   in [0, 1]`
+```python
+relation_type = "raman_embedding_neighbor"
+raman_embedding_cosine = sim_raman
+```
 
-Captures structural similarity that categorical rules miss
-(e.g. different prototype but geometrically / topologically similar).
+### Rationale
 
-#### R6. `raman_embedding_neighbor`
+This edge captures spectroscopic similarity.
 
-- **Embedding:** `raman_embedding` (pretrained Raman embedding, already available per node).
-- **Score:** cosine similarity on L2-normalized vectors.
-- **Sparsification:** keep top `p_raman_embedding` percent of all pairs, subject to optional absolute floor.
-- **Edge:**
-  - `relation_type = "raman_embedding_neighbor"`
-  - `weight       = sim_raman   in [0, 1]`
-
-Captures spectroscopic similarity. Because the Raman embedding was trained on the full spectrum, this edge **replaces** the original `raman_neighbor` rule that used raw 4000-dim cosine — using both double-counts the same signal.
+Raw 4000-dimensional Raman cosine is not used as a separate edge, because the Raman embedding already represents spectrum-level similarity. Raw spectra and peak lists remain available on the node for downstream Raman matching and explanation.
 
 ---
 
-## 4. Aggregation for the agent
+## 4. How the agent uses the KG
 
-When the agent needs a single similarity score between two nodes `(a, b)`
-(e.g. for ranking retrieval results), aggregate across the edges present between them:
+The KG does not produce a final hand-designed similarity score between two materials.
 
+Instead, for a pair of nodes `(a, b)`, the graph returns:
+
+```python
+relations(a, b) = {
+    edge_1.relation_type,
+    edge_2.relation_type,
+    ...
+}
 ```
-score(a, b) = max over edges e in E(a,b) of weight(e)
+
+and the corresponding metadata:
+
+```python
+evidence(a, b) = {
+    "composition_distance": ...,
+    "shared_chalcogens": ...,
+    "mass_distance": ...,
+    "mean_chalcogen_mass_delta": ...,
+    "structure_embedding_cosine": ...,
+    "raman_embedding_cosine": ...
+}
 ```
 
-Always return the **list of contributing edge types** alongside the score so the agent can produce an explanation like:
+The agent then learns which relation type is useful for a given exploration state.
 
-> MoSe2 is related to MoS2 via `structure_neighbor` (0.90) and
-> `raman_embedding_neighbor` (0.87). The pair is not a Janus pair.
+For example, the agent may learn:
 
-If a blended score is needed later (for learning-to-rank), prefer learning per-edge-type weights on a held-out task rather than hand-tuning a weighted sum now.
+* follow `raman_embedding_neighbor` when the Raman target is specific
+* follow `same_prototype` when searching within a structural family
+* follow `chalcogen_mass_trend` when the target Raman peak should move to lower frequency
+* follow `janus_analog` when extra Raman-active modes may be relevant
+* follow `structure_embedding_neighbor` when symbolic labels are insufficient
+
+The graph provides possible routes.
+The action policy decides which route to take.
 
 ---
 
-## 5. Summary table
+## 5. Example explanation
 
-| Rule | Relation                        | Trigger                                                 | Weight                |
-|------|---------------------------------|---------------------------------------------------------|-----------------------|
-| R1   | `structure_neighbor`            | same prototype & composition_distance == 1              | `0.90`                |
-| R2   | `same_prototype`                | same prototype & composition_distance >= 2              | `0.80`                |
-| R3   | `shared_chalcogen`              | `|chalcogens(a) & chalcogens(b)| >= 1`                  | `0.50 + 0.10 * k`     |
-| R4   | `same_family`                   | same family & not R1/R2                                 | `0.50`                |
-| R5   | `structure_embedding_neighbor`  | cosine(structure_embedding) in top `p_s%`               | cosine sim, clipped   |
-| R6   | `raman_embedding_neighbor`      | cosine(raman_embedding) in top `p_r%`                   | cosine sim, clipped   |
+For example, the KG may return:
 
-**Dropped vs. original proposal:**
-- `same_metal` — too dense, information already in `structure_neighbor` / node attr.
-- `raman_neighbor` (raw 4000-dim cosine) — redundant with R6 (`raman_embedding_neighbor`).
-- `janus_analog` (standalone edge) — folded into R1 as `is_janus_pair` attribute.
+```text
+MoS2 is related to MoSe2 through:
+- same_prototype
+- structure_neighbor
+- shared_chalcogen
+- chalcogen_mass_trend
+```
+
+The agent can explain:
+
+```text
+MoSe2 is explored from MoS2 because it has the same prototype and metal site,
+but replaces S with the heavier Se chalcogen. This mass change provides a
+physically meaningful Raman exploration direction, because heavier chalcogens
+may shift related vibrational modes toward lower frequency.
+```
+
+For a Janus material:
+
+```text
+MoS2 is related to Janus MoSSe through:
+- same_prototype
+- structure_neighbor
+- shared_chalcogen
+- janus_analog
+- chalcogen_mass_trend
+```
+
+The agent can explain:
+
+```text
+Janus MoSSe is explored because it is a Janus analog of MoS2, shares the same
+prototype and metal, and introduces top-bottom chalcogen asymmetry. This may
+change Raman activity through symmetry breaking and mass asymmetry.
+```
+
+---
+
+## 6. Summary table
+
+| Rule | Relation                       | Trigger                                                                   | Stored evidence                                           |
+| ---- | ------------------------------ | ------------------------------------------------------------------------- | --------------------------------------------------------- |
+| R1   | `structure_neighbor`           | same prototype base and `composition_distance == 1`                       | changed site, composition distance, Janus-pair flag       |
+| R2   | `same_prototype`               | same prototype base                                                       | prototype base                                            |
+| R3   | `shared_chalcogen`             | at least one shared chalcogen                                             | shared chalcogens, shared count                           |
+| R4   | `same_family`                  | same family                                                               | family                                                    |
+| R5   | `janus_analog`                 | same prototype base, same metal, different Janus status, shared chalcogen | Janus-pair flag, shared chalcogens                        |
+| R6   | `atomic_mass_neighbor`         | close in atomic-mass vector space                                         | mass distance, site-wise mass deltas                      |
+| R7   | `chalcogen_mass_trend`         | same prototype base and metal, different mean chalcogen mass              | lighter/heavier direction, expected Raman shift direction |
+| R8   | `janus_mass_asymmetry`         | both Janus and similar mass asymmetry                                     | asymmetry values and delta                                |
+| R9   | `structure_embedding_neighbor` | top percentile by structure embedding cosine                              | structure embedding cosine                                |
+| R10  | `raman_embedding_neighbor`     | top percentile by Raman embedding cosine                                  | Raman embedding cosine                                    |
+
